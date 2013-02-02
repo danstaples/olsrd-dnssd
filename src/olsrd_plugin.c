@@ -51,7 +51,7 @@
 #include "olsr_cookie.h"        /* olsr_alloc_cookie() */
 
 /* P2PD includes */
-#include "p2pd.h"               /* InitP2pd(), CloseP2pd() */
+#include "dnssd.h"               /* InitP2pd(), CloseP2pd() */
 #include "NetworkInterfaces.h"	/* AddNonOlsrIf */
 
 static void __attribute__ ((constructor)) my_init(void);
@@ -112,6 +112,8 @@ static const struct olsrd_plugin_parameters plugin_parameters[] = {
   {.name = "P2pdTtl", .set_plugin_parameter = &SetP2pdTtl, .data = NULL },
   {.name = "UdpDestPort",.set_plugin_parameter = &AddUdpDestPort,.data = NULL},
   {.name = "UseHashFilter",.set_plugin_parameter = &SetP2pdUseHashFilter,.data = NULL},
+  {.name = "ServiceFileDir",.set_plugin_parameter = &SetupServiceList,.data = NULL},
+  {.name = "Domain",.set_plugin_parameter = &SetDomain,.data = NULL}
 };
 
 /* -------------------------------------------------------------------------

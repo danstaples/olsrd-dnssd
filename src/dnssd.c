@@ -39,7 +39,7 @@
  */
 
 
-#include "p2pd.h"
+#include "dnssd.h"
 
 /* System includes */
 #include <stddef.h>             /* NULL */
@@ -63,6 +63,9 @@
 
 #include <time.h>
 
+#include <dirent.h>
+#include <regex.h>
+
 /* OLSRD includes */
 #include "plugin_util.h"        /* set_plugin_int */
 #include "defs.h"               /* olsr_cnf, //OLSR_PRINTF */
@@ -83,6 +86,10 @@
                                    BMF_ENCAP_LEN etc. */
 #include "PacketHistory.h"
 #include "dllist.h"
+
+// struct RrListByTtl *rr_buffer    = NULL;
+struct MdnsService *ServiceList    = NULL;
+char ServiceDomain[MAX_DOMAIN_LEN];
 
 int P2pdTtl                        = 0;
 int P2pdUseHash                    = 0;  /* Switch off hash filter by default */
@@ -1096,4 +1103,169 @@ check_and_mark_recent_packet(unsigned char *data,
   }
 
   return false;
+}
+
+int SetupServiceList(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused))) {
+  //char filename[MAX_FILE_LEN + 1];
+  char file_suffix[9], line[BUFFER_LENGTH], ttl_string[BUFFER_LENGTH], service_name[BUFFER_LENGTH];
+  DIR *dp;
+  FILE *fp;
+  struct dirent *ep;
+  const char ttl_pattern[] = "^<txt-record>ttl=([[:digit:]]+)</txt-record>$";
+  const char domain_pattern[] = "^<domain-name>mesh.local</domain-name>$";
+  const char name_pattern[] = "^<name( replace-wildcards=\"yes\")?>([.]*)</name>$";
+  regex_t ttl_regex, domain_regex, name_regex;
+  const int n_matches = 3;
+  regmatch_t match[n_matches];
+  //int domain_match, ttl_match;
+  unsigned int found_domain, ttl, match_string_len;
+  
+  assert(value != NULL);
+  
+  if (strlen(value) > MAX_FILE_LEN) {
+    OLSR_PRINTF(1, "%s: Invalid argument for \"ServiceFileDir\"", PLUGIN_NAME_SHORT);
+    return -1;
+  }
+  
+  dp = opendir(value);
+  if (dp == NULL) {
+    OLSR_PRINTF(1, "%s: Unable to open directory given by \"ServiceFileDir\"", PLUGIN_NAME_SHORT);
+    return -1;
+  }
+  
+  if (regcomp(&ttl_regex, ttl_pattern, REG_NEWLINE) || 
+		regcomp(&domain_regex, domain_pattern, REG_NOSUB | REG_NEWLINE) ||
+		regcomp(&name_regex, name_pattern, REG_NEWLINE)) {
+    OLSR_PRINTF(1, "%s: Unable to compile regex", PLUGIN_NAME_SHORT);
+    return -1;
+  }
+  while ((ep = readdir(dp))) {
+    // if ep->d_name ends in .service, open it
+    if (strlen(ep->d_name) > 8) {
+      strncpy(file_suffix, ep->d_name + strlen(ep->d_name) - 8, 8);
+      file_suffix[8] = '\0';
+      if (!strcmp(file_suffix,".service")) {
+        // if correct domain and has u_int ttl txt-record, add to ServiceList
+        found_domain = 0;
+	ttl = 0;
+	service_name[0] = '\0';
+        fp = fopen(ep->d_name, "rt");
+        while (fgets(line, BUFFER_LENGTH, fp)) {
+	  if (!found_domain && !regexec(&domain_regex, line, 0, NULL, 0))
+	    found_domain = 1;
+	  else if (!ttl && !regexec(&ttl_regex, line, n_matches, match, 0)) {
+	    // parse match and store ttl
+	    if (match[1].rm_so != -1) {
+	      match_string_len = match[1].rm_so - match[1].rm_eo;
+	      strncpy(ttl_string, line + match[1].rm_so, match_string_len);
+	      ttl_string[match_string_len] = '\0';
+	      //sscanf(ttl_string, "%d", &ttl);
+	      ttl = atoi(ttl_string);
+	      ttl = (ttl < 255 && ttl > 0) ? ttl : 0;
+	    }
+	  } else if (strlen(service_name) == 0 && !regexec(&name_regex, line, n_matches, match, 0)) {
+	    if (match[2].rm_so != -1) {
+	      match_string_len = match[2].rm_so - match[2].rm_eo;
+	      strncpy(service_name, line + match[2].rm_so, match_string_len);
+	      service_name[match_string_len] = '\0';
+	    }
+	  }
+	}
+        fclose(fp);
+	// check found_domain and ttl...if yes, add to servicelist
+	if (strlen(service_name) > 0 && found_domain && ttl) {
+	  AddToServiceList(service_name, ep->d_name, ttl);
+	}
+      }
+    }
+  }
+  (void)closedir(dp);
+  
+  if (ServiceList == NULL) {
+    OLSR_PRINTF(1, "%s: No valid service files found", PLUGIN_NAME_SHORT);
+  }
+  
+  regfree(&domain_regex);
+  regfree(&ttl_regex);
+  regfree(&name_regex);
+  
+  return 0;
+}
+
+int SetDomain(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused))) {
+  assert(value != NULL);
+  
+  if (strlen(value) >= MAX_DOMAIN_LEN) {
+    OLSR_PRINTF(1, "%s: Invalid argument for \"Domain\"", PLUGIN_NAME_SHORT);
+    return -1;
+  }
+  
+  strncpy(ServiceDomain, value, MAX_DOMAIN_LEN - 1);
+  ServiceDomain[MAX_DOMAIN_LEN - 1] = '\0';
+  
+  return 0;
+}
+
+void AddToRrBuffer(struct RrListByTtl **buf, int ttl, ldns_rr *entry) {
+  struct RrListByTtl *s;
+  
+  HASH_FIND_INT(*buf, &ttl, s);
+  if (s==NULL) {
+    s = malloc(sizeof(struct RrListByTtl));
+    s->ttl = ttl;
+    // create ldns_rrlist
+    s->rr_list = ldns_rr_list_new();
+    HASH_ADD_INT(*buf, ttl, s);
+  }
+  //check if entry already in s->rr_list
+  if (!ldns_rr_list_contains_rr(s->rr_list, entry)) {
+    //if not, add entry to s->rr_list
+    ldns_rr_list_push_rr(s->rr_list, entry);
+  }
+}
+
+struct RrListByTtl *GetRrListByTtl(const struct RrListByTtl **buf, int ttl) {
+  struct RrListByTtl *s;
+  
+  HASH_FIND_INT(*buf, &ttl, s);
+  return s;
+}
+
+void AddToServiceList(char *name, char *path, int ttl) {
+  struct MdnsService *s;
+  
+  HASH_FIND_STR(ServiceList, name, s);
+  if (s==NULL) {
+    s = malloc(sizeof(struct MdnsService));
+    strncpy(s->service_name, name, strlen(name));
+    HASH_ADD_STR(ServiceList, service_name, s);
+  }
+  strncpy(s->file_path, path, strlen(path));
+  s->ttl = ttl;
+}
+
+struct MdnsService *GetServiceByName(char *name) {
+  struct MdnsService *s;
+  
+  HASH_FIND_STR(ServiceList, name, s);
+  return s;
+}
+
+void DeleteListByTtl(struct RrListByTtl **buf, int ttl) {
+  struct RrListByTtl *s;
+  HASH_FIND_INT(*buf, &ttl, s);
+  if (s!=NULL) {
+    DeleteList(buf, s);
+  }
+}
+
+void DeleteList(struct RrListByTtl **buf, struct RrListByTtl *list) {
+  HASH_DEL(*buf, list);
+  ldns_rr_list_deep_free(list->rr_list);
+  free(list);
+}
+
+void DeleteService(struct MdnsService *service) {
+  HASH_DEL(ServiceList, service);
+  free(service);
 }

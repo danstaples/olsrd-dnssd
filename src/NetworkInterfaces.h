@@ -51,7 +51,7 @@
 
 /* Plugin includes */
 #include "Packet.h"             /* IFHWADDRLEN */
-#include "p2pd.h"
+#include "dnssd.h"
 
 /* Size of buffer in which packets are received */
 #define P2PD_BUFFER_SIZE 2048

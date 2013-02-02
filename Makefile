@@ -1,6 +1,6 @@
 
 OLSRD_PLUGIN =	true
-PLUGIN_NAME =	olsrd_p2pd
+PLUGIN_NAME =	olsrd_dnssd
 PLUGIN_VER =	0.1.0
 
 TOPDIR = ../..
@@ -14,7 +14,7 @@ CPPFLAGS += $(OS_CFLAG_PTHREAD)
 ifneq ($(OS),linux)
 
 default_target install clean:
-	@echo "*** p2pd Plugin only supported on Linux, sorry!"
+	@echo "*** dnssd Plugin only supported on Linux, sorry!"
 
 else
 

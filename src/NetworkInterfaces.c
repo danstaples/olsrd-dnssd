@@ -71,7 +71,7 @@
 
 /* Plugin includes */
 #include "Packet.h"             /* IFHWADDRLEN */
-#include "p2pd.h"               /* PLUGIN_NAME, MainAddressOf() */
+#include "dnssd.h"               /* PLUGIN_NAME, MainAddressOf() */
 //#include "Address.h"            /* IsMulticast() */
 
 

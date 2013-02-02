@@ -39,8 +39,8 @@
  */
 
 
-#ifndef _P2PD_H
-#define _P2PD_H
+#ifndef _DNSSD_H
+#define _DNSSD_H
 
 #define REMOVE_LOG_DEBUG
 
@@ -51,18 +51,27 @@
 #include "duplicate_set.h"
 //#include "socket_parser.h"
 #include "dllist.h"
+#include "uthash.h"
+#include "ipcalc.h"
+#include "lq_packet.h"
+#include <ldns/ldns.h>
 
 #define P2PD_MESSAGE_TYPE         132
 #define PARSER_TYPE               P2PD_MESSAGE_TYPE
 #define P2PD_VALID_TIME           180		/* seconds */
 
-/* P2PD plugin data */
-#define PLUGIN_NAME               "OLSRD P2PD plugin"
-#define PLUGIN_NAME_SHORT         "OLSRD P2PD"
+/* DNSSD plugin data */
+#define PLUGIN_NAME               "OLSRD DNSSD plugin"
+#define PLUGIN_NAME_SHORT         "OLSRD DNSSD"
 #define PLUGIN_VERSION            "0.1.0 (" __DATE__ " " __TIME__ ")"
 #define MOD_DESC PLUGIN_NAME      " " PLUGIN_VERSION
 #define PLUGIN_INTERFACE_VERSION  5
 #define IPHDR_FRAGMENT_MASK       0xC000
+
+#define MAX_FILE_LEN              150
+#define MAX_NAME_LEN              100
+#define MAX_DOMAIN_LEN            100
+#define BUFFER_LENGTH             1024
 
 /* Forward declaration of OLSR interface type */
 struct interface;
@@ -80,6 +89,19 @@ struct UdpDestPort {
   union olsr_ip_addr             address;
   uint16_t                       port;
   struct UdpDestPort *           next;
+};
+
+struct RrListByTtl {
+  int                            ttl;
+  ldns_rr_list *                 rr_list;
+  UT_hash_handle                 hh;
+};
+
+struct MdnsService {
+  char                           service_name[MAX_NAME_LEN + 1];
+  char                           file_path[MAX_FILE_LEN + 1];
+  int                            ttl;
+  UT_hash_handle                 hh;
 };
 
 extern int P2pdTtl;
@@ -108,7 +130,18 @@ void olsr_p2pd_gen(unsigned char *packet, int len);
 /* Parser function to register with the scheduler */
 bool olsr_parser(union olsr_message *, struct interface *, union olsr_ip_addr *);
 
-#endif /* _P2PD_H */
+int SetupServiceList(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused)));
+int SetDomain(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused)));
+
+void AddToRrBuffer(struct RrListByTtl **buf, int ttl, ldns_rr *entry);
+struct RrListByTtl *GetRrListByTtl(const struct RrListByTtl **buf, int ttl);
+void AddToServiceList(char *name, char *path, int ttl);
+struct MdnsService *GetServiceByName(char *name);
+void DeleteListByTtl(struct RrListByTtl **buf, int ttl);
+void DeleteList(struct RrListByTtl **buf, struct RrListByTtl *list);
+void DeleteService(struct MdnsService *service);
+
+#endif /* _DNSSD_H */
 
 /*
  * Local Variables:
