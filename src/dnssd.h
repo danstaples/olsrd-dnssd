@@ -68,10 +68,14 @@
 #define PLUGIN_INTERFACE_VERSION  5
 #define IPHDR_FRAGMENT_MASK       0xC000
 
-#define MAX_FILE_LEN              150
-#define MAX_NAME_LEN              100
+#define MAX_FILE_LEN              72
+#define MAX_DIR_LEN               200
+#define MAX_FIELD_LEN              100
 #define MAX_DOMAIN_LEN            100
 #define BUFFER_LENGTH             1024
+#define IPV6_HEADER_LENGTH        40
+#define UDP_HEADER_LENGTH         8
+#define HOSTNAME_LEN              64
 
 /* Forward declaration of OLSR interface type */
 struct interface;
@@ -93,16 +97,21 @@ struct UdpDestPort {
 
 struct RrListByTtl {
   int                            ttl;
-  ldns_rr_list *                 rr_list;
+  ldns_rr_list *                 rr_list[3];
+  uint16_t                       rr_count[3];
   UT_hash_handle                 hh;
 };
 
 struct MdnsService {
-  char                           service_name[MAX_NAME_LEN + 1];
+  char                           id[2 * MAX_FIELD_LEN + 1];
+  char                           service_name[MAX_FIELD_LEN + 1];
+  char                           service_type[MAX_FIELD_LEN + 1];
   char                           file_path[MAX_FILE_LEN + 1];
   int                            ttl;
   UT_hash_handle                 hh;
 };
+
+typedef enum { IPv4, IPv6 } PKT_TYPE;
 
 extern int P2pdTtl;
 extern int P2pdDuplicateTimeout;
@@ -116,7 +125,7 @@ void P2pdPError(const char *format, ...) __attribute__ ((format(printf, 1, 2)));
 union olsr_ip_addr *MainAddressOf(union olsr_ip_addr *ip);
 int InitP2pd(struct interface *skipThisIntf);
 void CloseP2pd(void);
-int SetP2pdTtl(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused)));
+//int SetP2pdTtl(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused)));
 int AddUdpDestPort(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused)));
 bool InUdpDestPortList(int ip_version, union olsr_ip_addr *addr, uint16_t port);
 int SetP2pdTtl(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused)));
@@ -125,7 +134,7 @@ bool p2pd_message_seen(struct node **head, struct node **tail, union olsr_messag
 void p2pd_store_message(struct node **head, struct node **tail, union olsr_message *m);
 bool p2pd_is_duplicate_message(union olsr_message *msg);
 
-void olsr_p2pd_gen(unsigned char *packet, int len);
+void olsr_p2pd_gen(unsigned char *packet, int len, int ttl);
 
 /* Parser function to register with the scheduler */
 bool olsr_parser(union olsr_message *, struct interface *, union olsr_ip_addr *);
@@ -133,13 +142,19 @@ bool olsr_parser(union olsr_message *, struct interface *, union olsr_ip_addr *)
 int SetupServiceList(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused)));
 int SetDomain(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused)));
 
-void AddToRrBuffer(struct RrListByTtl **buf, int ttl, ldns_rr *entry);
+void AddToRrBuffer(struct RrListByTtl **buf, int ttl, ldns_rr *entry, int section);
 struct RrListByTtl *GetRrListByTtl(const struct RrListByTtl **buf, int ttl);
-void AddToServiceList(char *name, char *path, int ttl);
-struct MdnsService *GetServiceByName(char *name);
+void AddToServiceList(char *name, size_t name_len, char *type, size_t type_len, char *path, size_t path_len, int ttl);
+struct MdnsService *GetServiceById(char *id);
 void DeleteListByTtl(struct RrListByTtl **buf, int ttl);
 void DeleteList(struct RrListByTtl **buf, struct RrListByTtl *list);
+void DeleteListArray(struct RrListByTtl **buf);
 void DeleteService(struct MdnsService *service);
+void DnssdSendPacket(ldns_pkt *pkt, PKT_TYPE pkt_type, unsigned char *encapsulationUdpData, int nBytes, int ttl);
+int IsRrLocal(ldns_rr *rr, int *ttl);
+size_t UnescapeStr(char *str, size_t nBytes);
+char *ReplaceHostname(char *str, size_t nBytes, const char *hostname, size_t hostname_len);
+unsigned short CheckSum(unsigned short *ptr,int nbytes);
 
 #endif /* _DNSSD_H */
 

@@ -38,6 +38,7 @@
  *
  */
 
+#define _GNU_SOURCE
 
 #include "dnssd.h"
 
@@ -66,6 +67,8 @@
 #include <dirent.h>
 #include <regex.h>
 
+#include <stdio.h>
+
 /* OLSRD includes */
 #include "plugin_util.h"        /* set_plugin_int */
 #include "defs.h"               /* olsr_cnf, //OLSR_PRINTF */
@@ -90,6 +93,7 @@
 // struct RrListByTtl *rr_buffer    = NULL;
 struct MdnsService *ServiceList    = NULL;
 char ServiceDomain[MAX_DOMAIN_LEN];
+size_t ServiceDomainLength;
 
 int P2pdTtl                        = 0;
 int P2pdUseHash                    = 0;  /* Switch off hash filter by default */
@@ -461,11 +465,11 @@ olsr_parser(union olsr_message *m,
  * Data Used  : none
  * ------------------------------------------------------------------------- */
 void
-olsr_p2pd_gen(unsigned char *packet, int len)
+olsr_p2pd_gen(unsigned char *packet, int len, int ttl)
 {
   /* send buffer: huge */
   char buffer[10240];
-  int aligned_size;
+  int aligned_size, pkt_ttl;
   union olsr_message *message = (union olsr_message *)buffer;
   struct interface *ifn;
 
@@ -475,13 +479,20 @@ olsr_p2pd_gen(unsigned char *packet, int len)
     aligned_size = (aligned_size - (aligned_size % 4)) + 4;
   }
 
+  if (ttl)
+    pkt_ttl = ttl;
+  else if (P2pdTtl)
+    pkt_ttl = P2pdTtl;
+  else
+    pkt_ttl = MAX_TTL;
+  
   /* fill message */
   if (olsr_cnf->ip_version == AF_INET) {
     /* IPv4 */
     message->v4.olsr_msgtype  = P2PD_MESSAGE_TYPE;
     message->v4.olsr_vtime    = reltime_to_me(P2PD_VALID_TIME * MSEC_PER_SEC);
     memcpy(&message->v4.originator, &olsr_cnf->main_addr, olsr_cnf->ipsize);
-    message->v4.ttl           = P2pdTtl ? P2pdTtl : MAX_TTL;
+    message->v4.ttl           = pkt_ttl;
     message->v4.hopcnt        = 0;
     message->v4.seqno         = htons(get_msg_seqno());
     message->v4.olsr_msgsize  = htons(aligned_size + 12);
@@ -493,7 +504,7 @@ olsr_p2pd_gen(unsigned char *packet, int len)
     message->v6.olsr_msgtype  = P2PD_MESSAGE_TYPE;
     message->v6.olsr_vtime    = reltime_to_me(P2PD_VALID_TIME * MSEC_PER_SEC);
     memcpy(&message->v6.originator, &olsr_cnf->main_addr, olsr_cnf->ipsize);
-    message->v6.ttl           = P2pdTtl ? P2pdTtl : MAX_TTL;
+    message->v6.ttl           = pkt_ttl;
     message->v6.hopcnt        = 0;
     message->v6.seqno         = htons(get_msg_seqno());
     message->v6.olsr_msgsize  = htons(aligned_size + 12 + 96);
@@ -512,7 +523,8 @@ olsr_p2pd_gen(unsigned char *packet, int len)
       if (net_outbuffer_push(ifn, message, aligned_size) != aligned_size) {
         //OLSR_PRINTF(1, "%s: could not send on interface: %s\n", PLUGIN_NAME_SHORT, ifn->int_name);
       }
-    }
+    } else
+      net_output(ifn);
   }
 }
 
@@ -613,7 +625,9 @@ InUdpDestPortList(int ip_version, union olsr_ip_addr *addr, uint16_t port)
 
 /* -------------------------------------------------------------------------
  * Function   : P2pdPacketCaptured
- * Description: Handle a captured IP packet
+ * Description: Handle a captured IP packet. Parses mDNS packets and sends
+ *              new packets containing local service records with custom
+ *              TTL values.
  * Input      : encapsulationUdpData - space for the encapsulation header,
  *              followed by the captured IP packet
  *              nBytes - The number of bytes in the data packet
@@ -631,9 +645,18 @@ P2pdPacketCaptured(unsigned char *encapsulationUdpData, int nBytes)
   struct ip6_hdr *ipHeader6;   /* The IP header inside the captured IP packet */
   struct udphdr *udpHeader;
   u_int16_t destPort;
+  ldns_pkt *p, *p2;
+  int p_size, ttl, nonlocal_list_count[3] = {0, 0, 0};
+  unsigned int i, j;
+  ldns_status s;
+  ldns_rr_list *full_list, *nonlocal_list[3];
+  ldns_rr *rr;
+  struct RrListByTtl *ttl_bucket, *rr_buf = NULL;
+  PKT_TYPE pkt_type;
 
   if ((encapsulationUdpData[0] & 0xf0) == 0x40) {       //IPV4
-
+    pkt_type = IPv4;
+    
     ipHeader = (struct ip *) ARM_NOWARN_ALIGN(encapsulationUdpData);
 
     dst.v4 = ipHeader->ip_dst;
@@ -670,8 +693,18 @@ P2pdPacketCaptured(unsigned char *encapsulationUdpData, int nBytes)
 #endif
        return;
     }
+    
+    p_size = nBytes - GetIpHeaderLength(encapsulationUdpData) - UDP_HEADER_LENGTH;
+    s = ldns_wire2pkt(&p, ARM_NOWARN_ALIGN(encapsulationUdpData + GetIpHeaderLength(encapsulationUdpData) + UDP_HEADER_LENGTH), p_size);
+    if (s != LDNS_STATUS_OK) {
+      OLSR_PRINTF(1, "%s: Error getting ipv4 dns packet\n", PLUGIN_NAME_SHORT);
+      return;
+    }
+    
+    
   }                            //END IPV4
   else if ((encapsulationUdpData[0] & 0xf0) == 0x60) {  //IPv6
+    pkt_type = IPv6;
 
     ipHeader6 = (struct ip6_hdr *) ARM_NOWARN_ALIGN(encapsulationUdpData);
 
@@ -700,7 +733,7 @@ P2pdPacketCaptured(unsigned char *encapsulationUdpData, int nBytes)
     if (check_and_mark_recent_packet(encapsulationUdpData, nBytes))
       return;
 
-    udpHeader = (struct udphdr *) ARM_NOWARN_ALIGN((encapsulationUdpData + 40));
+    udpHeader = (struct udphdr *) ARM_NOWARN_ALIGN((encapsulationUdpData + IPV6_HEADER_LENGTH));
     destPort = ntohs(udpHeader->dest);
 
     if (!InUdpDestPortList(AF_INET6, &dst, destPort)) {
@@ -711,15 +744,281 @@ P2pdPacketCaptured(unsigned char *encapsulationUdpData, int nBytes)
 #endif
       return;
     }
+    
+    p_size = nBytes - IPV6_HEADER_LENGTH - UDP_HEADER_LENGTH;
+    s = ldns_wire2pkt(&p, ARM_NOWARN_ALIGN(encapsulationUdpData + IPV6_HEADER_LENGTH + UDP_HEADER_LENGTH), p_size);
+    if (s != LDNS_STATUS_OK) {
+      OLSR_PRINTF(1, "%s: Error getting ipv6 dns packet\n", PLUGIN_NAME_SHORT);
+      return;
+    }
+    
   }                             //END IPV6
   else {
     return;                     //Is not IP packet
   }
 
-  // send the packet to OLSR forward mechanism
-  olsr_p2pd_gen(encapsulationUdpData, nBytes);
+  // do the magic here:
+  
+  // go through RR sections of mDNS packets, and yank out ones that represent local services
+  for (i = 0; i < 3; ++i) {
+    if (ldns_pkt_section_count(p, i + 1) == 0)
+      full_list = NULL;
+    else {
+      full_list = ldns_pkt_get_section_clone(p, i + 1);
+      nonlocal_list[i] = ldns_rr_list_new();
+    }
+    if (!full_list || ldns_pkt_section_count(p, i + 1) == 0)
+      continue;
+    for(j = 0; j < ldns_rr_list_rr_count(full_list); ++j) {
+      rr = ldns_rr_list_rr(full_list, j);
+      // check if RR is local service
+      if (IsRrLocal(rr, &ttl)) {
+        // if so, add to list
+        AddToRrBuffer(&rr_buf, ttl, rr, i);
+      } else {
+	// if not, add to non-local RR list
+	ldns_rr_list_push_rr(nonlocal_list[i], rr);
+	nonlocal_list_count[i] += 1;
+      }
+    }
+  }
+  
+  // Send packet with non-local RR list (this will include any question RRs)
+  p2 = ldns_pkt_clone(p);  // create new mDNS packet p2 cloned from original packet
+  ldns_pkt_set_answer(p2, (nonlocal_list_count[0]) ? nonlocal_list[0] : NULL);
+  ldns_pkt_set_authority(p2, (nonlocal_list_count[1]) ? nonlocal_list[1] : NULL);
+  ldns_pkt_set_additional(p2, (nonlocal_list_count[2]) ? nonlocal_list[2] : NULL);
+  for (i = 0; i < 3; ++i)
+    ldns_pkt_set_section_count(p2, i + 1, nonlocal_list_count[i]);
+  DnssdSendPacket(p2, pkt_type, encapsulationUdpData, nBytes, 0);
+  ldns_pkt_free(p2);
+  
+  // For each batch of RRs grouped by TTL, populate new mDNS packet to encapsulate in an OLSR packet and send to mesh
+  for (ttl_bucket = rr_buf; ttl_bucket != NULL; ttl_bucket=ttl_bucket->hh.next) {    
+    p2 = ldns_pkt_clone(p);
+    ldns_pkt_set_question(p2, NULL);
+    ldns_pkt_set_qdcount(p2, 0);
+    ldns_pkt_set_answer(p2, (ttl_bucket->rr_count[0]) ? ttl_bucket->rr_list[0] : NULL);
+    ldns_pkt_set_authority(p2, (ttl_bucket->rr_count[1]) ? ttl_bucket->rr_list[1] : NULL);
+    ldns_pkt_set_additional(p2, (ttl_bucket->rr_count[2]) ? ttl_bucket->rr_list[2] : NULL);
+    for (i = 0; i < 3; ++i)
+      ldns_pkt_set_section_count(p2, i + 1, ttl_bucket->rr_count[i]);
+    DnssdSendPacket(p2, pkt_type, encapsulationUdpData, nBytes, ttl_bucket->ttl);
+    ldns_pkt_free(p2);
+  }
+  
+  DeleteListArray(&rr_buf);
+  ldns_pkt_free(p);
 }                               /* P2pdPacketCaptured */
 
+/* -------------------------------------------------------------------------
+ * Function   : DnssdSendPacket
+ * Description: Encapsulate mDNS packet into OLSR packet with given TTL and
+ *              send to OLSR forwarding mechanism
+ * Input      : pkt - ldns packet to be converted and sent
+ *              pkt_type - either IPv4 or IPv6
+ *              encapsulationUdpData - raw packet buffer that includes
+ *                                     original IP and UDP headers
+ *              nBytes - size of encapsulationUdpData in bytes
+ *              ttl - max # of hops away packet should be sent
+ * Output     : none
+ * Return     : none
+ * Data Used  :
+ * ------------------------------------------------------------------------- */
+void DnssdSendPacket(ldns_pkt *pkt, PKT_TYPE pkt_type, unsigned char *encapsulationUdpData, int nBytes, int ttl) {
+  uint8_t *buf_ptr;
+  size_t buf_size;
+  int packet_size, ip_header_len;
+  struct ip *ipHeader;
+  struct ip6_hdr *ipHeader6;
+  struct udphdr *udpHeader;
+  unsigned short checksum;
+
+  // Set up packet headers
+  if (pkt_type == IPv4) {
+    ipHeader = (struct ip *) ARM_NOWARN_ALIGN(encapsulationUdpData);
+    udpHeader = (struct udphdr *) ARM_NOWARN_ALIGN((encapsulationUdpData + GetIpHeaderLength(encapsulationUdpData)));
+    ip_header_len = GetIpHeaderLength(encapsulationUdpData) + UDP_HEADER_LENGTH;
+  } else if (pkt_type == IPv6) {
+    ipHeader6 = (struct ip6_hdr *) ARM_NOWARN_ALIGN(encapsulationUdpData);
+    udpHeader = (struct udphdr *) ARM_NOWARN_ALIGN((encapsulationUdpData + 40));
+    ip_header_len = IPV6_HEADER_LENGTH + UDP_HEADER_LENGTH;
+  } else
+    return;
+  
+  // convert packet to wire format buffer
+  ldns_pkt2wire(&buf_ptr, pkt, &buf_size);
+  packet_size = ip_header_len + buf_size;
+  
+  // copy new packet data to encapsulationUdpData buffer (size should be smaller than original packet, so should be no need to re-allocate space)
+  if (packet_size > nBytes) {
+    OLSR_PRINTF(1, "%s: New packet size exceeds buffer size!\n", PLUGIN_NAME_SHORT);
+    olsr_p2pd_gen(encapsulationUdpData, nBytes, 0);  // if new packet larger than original, send original packet unmodified
+    free(buf_ptr);
+    return;
+  }
+
+  // time to do some raw packet-fu
+  // calculate new UDP length and checksum
+  udpHeader->len = htons(UDP_HEADER_LENGTH + buf_size);
+  
+  memcpy(encapsulationUdpData + ip_header_len, buf_ptr, buf_size);
+  checksum = CheckSum((unsigned short *)encapsulationUdpData, packet_size);
+  udpHeader->check = checksum;
+  
+  // calculate new IP header:
+  // for IPv4, packet length ((u_short)ipHeader->ip_len) and header checksum ((u_short)ipHeader->ip_sum)
+  // for IPv6, payload length ((u_int16_t)ipHeader6->ip6_ctlun.ip6_un1.ip6_un1_plen)
+  if (pkt_type == IPv4) {       //IPV4
+      ipHeader->ip_len = htons(packet_size);
+      checksum = CheckSum((unsigned short *)encapsulationUdpData, packet_size);
+      ipHeader->ip_sum = checksum;
+  } else if (pkt_type == IPv6) {  //IPv6  
+      ipHeader6->ip6_ctlun.ip6_un1.ip6_un1_plen = htons(packet_size);
+  }
+  
+  // send the packet to OLSR forward mechanism
+  olsr_p2pd_gen(encapsulationUdpData, packet_size, ttl);
+  free(buf_ptr);
+}
+
+/* -------------------------------------------------------------------------
+ * Function   : CheckSum
+ * Description: Simple packet header checksum calculator, taken from
+ *              http://www.binarytides.com/raw-udp-sockets-c-linux/
+ * Input      : ptr - pointer to data buffer over which to calculate sum
+ *              nbytes - length of buffer in bytes
+ * Output     : none
+ * Return     : returns checksum
+ * Data Used  :
+ * ------------------------------------------------------------------------- */
+unsigned short CheckSum(unsigned short *ptr,int nbytes)
+{
+    register long sum;
+    unsigned short oddbyte;
+    register short answer;
+ 
+    sum=0;
+    while(nbytes>1) {
+        sum+=*ptr++;
+        nbytes-=2;
+    }
+    if(nbytes==1) {
+        oddbyte=0;
+        *((u_char*)&oddbyte)=*(u_char*)ptr;
+        sum+=oddbyte;
+    }
+ 
+    sum = (sum>>16)+(sum & 0xffff);
+    sum = sum + (sum>>16);
+    answer=(short)~sum;
+     
+    return(answer);
+}
+
+/* -------------------------------------------------------------------------
+ * Function   : IsRrLocal
+ * Description: This function checks whether a DNS resource record
+ *              represents a service local to this device
+ * Input      : rr - resource record to check
+ *              ttl - int to store TTL of local service if found
+ * Output     : stores TTL of local service in &ttl
+ * Return     : 1 if RR represents local service, 0 otherwise
+ * Data Used  :
+ * ------------------------------------------------------------------------- */
+int IsRrLocal(ldns_rr *rr, int *ttl) {
+  struct MdnsService *s;
+  ldns_rdf *owner;
+  char *id, *owner_str, *rdata_str;
+  
+  // if owner == <service name>.<type>.<domain>.
+  owner = ldns_rr_owner(rr);
+  owner_str = ldns_rdf2str(owner);
+  UnescapeStr(owner_str, strlen(owner_str));
+  if (strlen(owner_str) <= (strlen(ServiceDomain) + 2)) {
+    free(owner_str);
+    return 0;
+  }
+  id = malloc(sizeof(char)*(strlen(owner_str) - strlen(ServiceDomain) - 1));
+  strncpy(id, owner_str, strlen(owner_str) - strlen(ServiceDomain) - 2);
+  id[strlen(owner_str) - strlen(ServiceDomain) - 2] = '\0';
+  s = GetServiceById(id);
+  free(owner_str);
+  free(id);
+  // if owner minus .<domain> in ServiceList then add RR to list
+  if (s) {
+    *ttl = s->ttl;
+    return 1;
+  }
+  
+  // if type == PTR && RDATA == <service name>.<type>.<domain>.
+  if (rr->_rr_type == LDNS_RR_TYPE_PTR && rr->_rd_count == 1) {
+    // check RDATA
+    rdata_str = ldns_rdf2str(rr->_rdata_fields[0]);
+    UnescapeStr(rdata_str, strlen(rdata_str));
+    if (strlen(rdata_str) <= (strlen(ServiceDomain) + 2)) {
+      free(rdata_str);
+      return 0;
+    }
+    id = malloc(sizeof(char)*(strlen(rdata_str) - strlen(ServiceDomain) - 1));
+    strncpy(id, rdata_str, strlen(rdata_str) - strlen(ServiceDomain) - 2);
+    id[strlen(rdata_str) - strlen(ServiceDomain) - 2] = '\0';
+    s = GetServiceById(id);
+    free(rdata_str);
+    free(id);
+    if (s) {
+      *ttl = s->ttl;
+      return 1;
+    }
+  }
+  
+  return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Function   : UnescapeStr
+ * Description: This function removes backslash escaping in DNS resource
+ *              record strings.
+ * Input      : str - string to unescape
+ *              nBytes - length of string in bytes
+ * Output     : none
+ * Return     : length of unescaped string in bytes
+ * Data Used  :
+ * ------------------------------------------------------------------------- */
+size_t UnescapeStr(char *str, size_t nBytes) {
+  char octal[4], tmp[nBytes];
+  unsigned int i;
+  int converted = 0;
+  
+  for (i = 0; i < (nBytes - 1); i++) {
+    converted = 0;
+    if (str[i] == '\\') {
+      if ((nBytes - i) > 3) {
+        strncpy(octal, str + i + 1, 3);
+        octal[3] = '\0';
+        if (!strcmp(octal, "032")) {
+	  // replace \032 with space
+	  str[i] = ' ';
+	  strncpy(tmp,str + i + 4, nBytes - i - 4);
+	  strncpy(str + i + 1, tmp, nBytes - i - 4);
+	  nBytes -= 3;
+	  str[nBytes] = '\0';
+	  converted = 1;
+	}
+      }
+      if (!converted) {
+	// remove escaping backslash
+	strncpy(tmp, str + i + 1, nBytes - i - 1);
+	strncpy(str + i, tmp, nBytes - i - 1);
+	nBytes--;
+	str[nBytes] = '\0';
+      }
+    }
+  }
+
+  // return new length
+  return nBytes;
+}
 
 /* -------------------------------------------------------------------------
  * Function   : DoP2pd
@@ -1107,22 +1406,25 @@ check_and_mark_recent_packet(unsigned char *data,
 
 int SetupServiceList(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused))) {
   //char filename[MAX_FILE_LEN + 1];
-  char file_suffix[9], line[BUFFER_LENGTH], ttl_string[BUFFER_LENGTH], service_name[BUFFER_LENGTH];
+  char file_suffix[9], line[BUFFER_LENGTH + 1], *ttl_string, *service_name, *service_type, *dirpath, *fullpath, hostname[HOSTNAME_LEN + 1];
   DIR *dp;
   FILE *fp;
   struct dirent *ep;
-  const char ttl_pattern[] = "^<txt-record>ttl=([[:digit:]]+)</txt-record>$";
-  const char domain_pattern[] = "^<domain-name>mesh.local</domain-name>$";
-  const char name_pattern[] = "^<name( replace-wildcards=\"yes\")?>([.]*)</name>$";
-  regex_t ttl_regex, domain_regex, name_regex;
+  const char ttl_pattern[] = "^[[:space:]]*<txt-record>ttl=([[:digit:]]+)</txt-record>[[:space:]]*$";
+  char *domain_pattern;
+  const char name_pattern[] = "^[[:space:]]*<name( replace-wildcards=\"yes\")?>(.*)</name>[[:space:]]*$";
+  const char type_pattern[] = "^[[:space:]]*<type>(.*)</type>[[:space:]]*$";
+  regex_t ttl_regex, domain_regex, name_regex, type_regex;
   const int n_matches = 3;
   regmatch_t match[n_matches];
-  //int domain_match, ttl_match;
   unsigned int found_domain, ttl, match_string_len;
+  size_t value_len, dname_len, service_name_len, service_type_len;
+  int ret;
   
   assert(value != NULL);
+  value_len = strlen(value);
   
-  if (strlen(value) > MAX_FILE_LEN) {
+  if (!value_len || value_len > MAX_FILE_LEN) {
     OLSR_PRINTF(1, "%s: Invalid argument for \"ServiceFileDir\"", PLUGIN_NAME_SHORT);
     return -1;
   }
@@ -1133,94 +1435,180 @@ int SetupServiceList(const char *value, void *data __attribute__ ((unused)), set
     return -1;
   }
   
-  if (regcomp(&ttl_regex, ttl_pattern, REG_NEWLINE) || 
-		regcomp(&domain_regex, domain_pattern, REG_NOSUB | REG_NEWLINE) ||
-		regcomp(&name_regex, name_pattern, REG_NEWLINE)) {
+  if (value[value_len - 1] == '/') {
+    dirpath = malloc(sizeof(char)*(value_len + 1));
+    strncpy(dirpath,value,value_len);
+    dirpath[value_len] = '\0';
+  } else {
+    dirpath = malloc(sizeof(char)*(value_len + 2));
+    strncpy(dirpath,value,value_len);
+    dirpath[value_len] = '/';
+    dirpath[value_len + 1] = '\0';
+  }
+  
+  if (asprintf(&domain_pattern, "^[[:space:]]*<domain-name>%s</domain-name>[[:space:]]*$",ServiceDomain) == -1) {
+    OLSR_PRINTF(1, "%s: Unable to allocate domain_pattern", PLUGIN_NAME_SHORT);
+    return -1;
+  }
+  if (regcomp(&ttl_regex, ttl_pattern, REG_NEWLINE | REG_EXTENDED) || 
+		regcomp(&domain_regex, domain_pattern, REG_NOSUB | REG_NEWLINE | REG_EXTENDED) ||
+		regcomp(&name_regex, name_pattern, REG_NEWLINE | REG_EXTENDED) || 
+     		regcomp(&type_regex, type_pattern, REG_NEWLINE | REG_EXTENDED)) {
     OLSR_PRINTF(1, "%s: Unable to compile regex", PLUGIN_NAME_SHORT);
     return -1;
   }
+  
   while ((ep = readdir(dp))) {
     // if ep->d_name ends in .service, open it
-    if (strlen(ep->d_name) > 8) {
-      strncpy(file_suffix, ep->d_name + strlen(ep->d_name) - 8, 8);
+    dname_len = strlen(ep->d_name);
+    if (dname_len > 8 && dname_len < MAX_DIR_LEN) {
+      strncpy(file_suffix, ep->d_name + dname_len - 8, 8);
       file_suffix[8] = '\0';
       if (!strcmp(file_suffix,".service")) {
         // if correct domain and has u_int ttl txt-record, add to ServiceList
         found_domain = 0;
 	ttl = 0;
-	service_name[0] = '\0';
-        fp = fopen(ep->d_name, "rt");
+	service_name = NULL;
+	service_type = NULL;
+	fullpath = malloc(sizeof(char)*(strlen(dirpath) + dname_len + 1));
+	strcpy(fullpath,dirpath);
+	strcat(fullpath,ep->d_name);
+        fp = fopen(fullpath, "rt");
+	if (fp == NULL) {
+	  OLSR_PRINTF(1, "%s: Error opening file %s: %s\n", PLUGIN_NAME_SHORT, fullpath, strerror(errno));
+	  return -1;
+	}
+	free(fullpath);
         while (fgets(line, BUFFER_LENGTH, fp)) {
-	  if (!found_domain && !regexec(&domain_regex, line, 0, NULL, 0))
+	  if (!found_domain && !regexec(&domain_regex, line, 0, NULL, 0)) {
 	    found_domain = 1;
-	  else if (!ttl && !regexec(&ttl_regex, line, n_matches, match, 0)) {
+	  }
+	  else if (!ttl  && !regexec(&ttl_regex, line, n_matches, match, 0)) {
 	    // parse match and store ttl
 	    if (match[1].rm_so != -1) {
-	      match_string_len = match[1].rm_so - match[1].rm_eo;
+	      match_string_len = match[1].rm_eo - match[1].rm_so;
+	      ttl_string = malloc(sizeof(char)*(match_string_len + 1));
 	      strncpy(ttl_string, line + match[1].rm_so, match_string_len);
 	      ttl_string[match_string_len] = '\0';
-	      //sscanf(ttl_string, "%d", &ttl);
 	      ttl = atoi(ttl_string);
+	      free(ttl_string);
 	      ttl = (ttl < 255 && ttl > 0) ? ttl : 0;
 	    }
-	  } else if (strlen(service_name) == 0 && !regexec(&name_regex, line, n_matches, match, 0)) {
+	  } else if (!service_name && !regexec(&name_regex, line, n_matches, match, 0)) {
 	    if (match[2].rm_so != -1) {
-	      match_string_len = match[2].rm_so - match[2].rm_eo;
-	      strncpy(service_name, line + match[2].rm_so, match_string_len);
-	      service_name[match_string_len] = '\0';
+	      service_name_len = match[2].rm_eo - match[2].rm_so;
+	      service_name = malloc(sizeof(char)*(service_name_len + 1));
+	      strncpy(service_name, line + match[2].rm_so, service_name_len);
+	      service_name[service_name_len] = '\0';
+	      if (match[1].rm_so != -1) {
+		// replace %h with hostname
+		ret = gethostname(hostname, HOSTNAME_LEN + 1);
+		if (ret == -1) {
+		  OLSR_PRINTF(1, "%s: Error fetching hostname\n", PLUGIN_NAME_SHORT);
+		  return -1;
+		}
+		hostname[HOSTNAME_LEN] = '\0';
+		//OLSR_PRINTF(1, "%s: before service_name: [%s]\n", PLUGIN_NAME_SHORT, service_name);
+		service_name = ReplaceHostname(service_name, service_name_len, hostname, strlen(hostname));
+		service_name_len = strlen(service_name);
+		//OLSR_PRINTF(1, "%s: after service_name: [%s]\n", PLUGIN_NAME_SHORT, service_name);
+	      }
+	    }
+	  } else if (!service_type && !regexec(&type_regex, line, n_matches, match, 0)) {
+	    if (match[1].rm_so != -1) {
+	      service_type_len = match[1].rm_eo - match[1].rm_so;
+	      service_type = malloc(sizeof(char)*(service_type_len + 1));
+	      strncpy(service_type, line + match[1].rm_so, service_type_len);
+	      service_type[service_type_len] = '\0';
 	    }
 	  }
 	}
         fclose(fp);
 	// check found_domain and ttl...if yes, add to servicelist
-	if (strlen(service_name) > 0 && found_domain && ttl) {
-	  AddToServiceList(service_name, ep->d_name, ttl);
+	if (service_name && service_type && found_domain && ttl) {
+	  OLSR_PRINTF(1, "Adding local service: %s\n", ep->d_name);
+	  AddToServiceList(service_name, service_name_len, service_type, service_type_len, ep->d_name, dname_len, ttl);
 	}
+	if (service_name)
+	  free(service_name);
+	if (service_type)
+	  free(service_type);
       }
     }
   }
   (void)closedir(dp);
   
   if (ServiceList == NULL) {
-    OLSR_PRINTF(1, "%s: No valid service files found", PLUGIN_NAME_SHORT);
+    OLSR_PRINTF(1, "No valid service files found!\n");
   }
   
   regfree(&domain_regex);
   regfree(&ttl_regex);
   regfree(&name_regex);
+  regfree(&type_regex);
+  free(domain_pattern);
+  free(dirpath);
   
   return 0;
+}
+
+char *ReplaceHostname(char *str, size_t nBytes, const char *hostname, size_t hostname_len) {
+  char *ptr, str_beginning[nBytes], str_end[nBytes];
+  size_t beginning_len, end_len;
+  
+  while ((ptr = strstr(str, "%h")) != NULL) {
+    beginning_len = ptr - str;
+    end_len = nBytes - (ptr - str) - 2;
+    strncpy(str_beginning, str, beginning_len);
+    strncpy(str_end, ptr + 2, end_len);
+    free(str);
+    str = malloc(sizeof(char)*(nBytes + hostname_len - 1));
+    strncpy(str, str_beginning, beginning_len);
+    strncpy(str + beginning_len, hostname, hostname_len);
+    strncpy(str + beginning_len + hostname_len, str_end, end_len);
+    nBytes = nBytes + hostname_len - 2;
+    str[nBytes] = '\0';
+  }
+  
+  return str;
 }
 
 int SetDomain(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused))) {
   assert(value != NULL);
   
   if (strlen(value) >= MAX_DOMAIN_LEN) {
-    OLSR_PRINTF(1, "%s: Invalid argument for \"Domain\"", PLUGIN_NAME_SHORT);
+    OLSR_PRINTF(1, "Invalid argument for \"Domain\"\n");
     return -1;
   }
   
   strncpy(ServiceDomain, value, MAX_DOMAIN_LEN - 1);
   ServiceDomain[MAX_DOMAIN_LEN - 1] = '\0';
+  ServiceDomainLength = strlen(ServiceDomain);
+  
+  OLSR_PRINTF(1, "Set domain: %s\n", value);
   
   return 0;
 }
 
-void AddToRrBuffer(struct RrListByTtl **buf, int ttl, ldns_rr *entry) {
+void AddToRrBuffer(struct RrListByTtl **buf, int ttl, ldns_rr *entry, int section) {
   struct RrListByTtl *s;
+  int i;
   
   HASH_FIND_INT(*buf, &ttl, s);
   if (s==NULL) {
     s = malloc(sizeof(struct RrListByTtl));
     s->ttl = ttl;
-    // create ldns_rrlist
-    s->rr_list = ldns_rr_list_new();
+    // create ldns_rr_list
+    s->rr_list[section] = ldns_rr_list_new();
+    for (i = 0; i < 3; ++i)
+      s->rr_count[i] = 0;
     HASH_ADD_INT(*buf, ttl, s);
   }
   //check if entry already in s->rr_list
-  if (!ldns_rr_list_contains_rr(s->rr_list, entry)) {
+  if (!ldns_rr_list_contains_rr(s->rr_list[section], entry)) {
     //if not, add entry to s->rr_list
-    ldns_rr_list_push_rr(s->rr_list, entry);
+    ldns_rr_list_push_rr(s->rr_list[section], entry);
+    s->rr_count[section] += 1;
   }
 }
 
@@ -1231,23 +1619,34 @@ struct RrListByTtl *GetRrListByTtl(const struct RrListByTtl **buf, int ttl) {
   return s;
 }
 
-void AddToServiceList(char *name, char *path, int ttl) {
+void AddToServiceList(char *name, size_t name_len, char *type, size_t type_len, char *path, size_t path_len, int ttl) {
   struct MdnsService *s;
+  char *id;
   
-  HASH_FIND_STR(ServiceList, name, s);
+  if (name_len > MAX_FIELD_LEN || type_len > MAX_FIELD_LEN || path_len > MAX_FILE_LEN)
+    return;
+  
+  id = malloc(sizeof(char)*(name_len + type_len + 2));
+  strncpy(id,name,name_len);
+  id[name_len] = '.';
+  strncpy(id + name_len + 1,type,type_len);
+  id[name_len + 1 + type_len] = '\0';
+  HASH_FIND_STR(ServiceList, id, s);
   if (s==NULL) {
     s = malloc(sizeof(struct MdnsService));
-    strncpy(s->service_name, name, strlen(name));
-    HASH_ADD_STR(ServiceList, service_name, s);
+    strcpy(s->id, id);
+    HASH_ADD_STR(ServiceList, id, s);
   }
-  strncpy(s->file_path, path, strlen(path));
+  strcpy(s->service_name, name);
+  strcpy(s->service_type, type);
+  strcpy(s->file_path, path);
   s->ttl = ttl;
+  free(id);
 }
 
-struct MdnsService *GetServiceByName(char *name) {
+struct MdnsService *GetServiceById(char *id) {
   struct MdnsService *s;
-  
-  HASH_FIND_STR(ServiceList, name, s);
+  HASH_FIND_STR(ServiceList, id, s);
   return s;
 }
 
@@ -1261,8 +1660,15 @@ void DeleteListByTtl(struct RrListByTtl **buf, int ttl) {
 
 void DeleteList(struct RrListByTtl **buf, struct RrListByTtl *list) {
   HASH_DEL(*buf, list);
-  ldns_rr_list_deep_free(list->rr_list);
+  //ldns_rr_list_deep_free(list->rr_list); /* this is done elsewhere */
   free(list);
+}
+
+void DeleteListArray(struct RrListByTtl **buf) {
+  struct RrListByTtl *s, *tmp;
+  HASH_ITER(hh, *buf, s, tmp) {
+    DeleteList(buf, s);
+  }
 }
 
 void DeleteService(struct MdnsService *service) {
