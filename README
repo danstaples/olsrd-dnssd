@@ -33,7 +33,7 @@ as a txt-record. Here is an example service file with a TTL value:
 
 To enable the Plugin use the following syntax:
 
-LoadPlugin "olsrd_dnssd.so.0.1.0"
+LoadPlugin "olsrd_dnssd.so.0.1.1"
 {
 # Specify interfaces where the hosts running Peer to Peer applications are
 # attached
@@ -128,6 +128,7 @@ forwards UDP plugin OLSR packets even if it is not aware of the new application.
 Revision history
 ================
 
+02/11/2013 - Fixed packet checksum calculations
 02/11/2013 - Added ServiceUpdateInterval configuration parameter for periodically
              refreshing list of local services
              * Declaring this version 0.1.0

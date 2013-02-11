@@ -834,27 +834,34 @@ P2pdPacketCaptured(unsigned char *encapsulationUdpData, int nBytes)
 void DnssdSendPacket(ldns_pkt *pkt, PKT_TYPE pkt_type, unsigned char *encapsulationUdpData, int nBytes, int ttl) {
   uint8_t *buf_ptr;
   size_t buf_size;
-  int packet_size, ip_header_len;
+  int packet_size, full_header_len, ip_header_len;
   struct ip *ipHeader;
   struct ip6_hdr *ipHeader6;
   struct udphdr *udpHeader;
-  unsigned short checksum;
+  unsigned char *pseudogram;
+  size_t pgram_size;
+  union {
+    struct pseudo_header psh;
+    struct pseudo_header6 psh6;
+  } pshdr;
 
   // Set up packet headers
   if (pkt_type == IPv4) {
     ipHeader = (struct ip *) ARM_NOWARN_ALIGN(encapsulationUdpData);
     udpHeader = (struct udphdr *) ARM_NOWARN_ALIGN((encapsulationUdpData + GetIpHeaderLength(encapsulationUdpData)));
-    ip_header_len = GetIpHeaderLength(encapsulationUdpData) + UDP_HEADER_LENGTH;
+    ip_header_len = GetIpHeaderLength(encapsulationUdpData);
+    full_header_len = ip_header_len + UDP_HEADER_LENGTH;
   } else if (pkt_type == IPv6) {
     ipHeader6 = (struct ip6_hdr *) ARM_NOWARN_ALIGN(encapsulationUdpData);
     udpHeader = (struct udphdr *) ARM_NOWARN_ALIGN((encapsulationUdpData + 40));
-    ip_header_len = IPV6_HEADER_LENGTH + UDP_HEADER_LENGTH;
+    ip_header_len = IPV6_HEADER_LENGTH;
+    full_header_len = ip_header_len + UDP_HEADER_LENGTH;
   } else
     return;
   
   // convert packet to wire format buffer
   ldns_pkt2wire(&buf_ptr, pkt, &buf_size);
-  packet_size = ip_header_len + buf_size;
+  packet_size = full_header_len + buf_size;
   
   // copy new packet data to encapsulationUdpData buffer (size should be smaller than original packet, so should be no need to re-allocate space)
   if (packet_size > nBytes) {
@@ -867,22 +874,48 @@ void DnssdSendPacket(ldns_pkt *pkt, PKT_TYPE pkt_type, unsigned char *encapsulat
   }
 
   // time to do some raw packet-fu
-  // calculate new UDP length and checksum
+
   udpHeader->len = htons(UDP_HEADER_LENGTH + buf_size);
-  
-  memcpy(encapsulationUdpData + ip_header_len, buf_ptr, buf_size);
-  checksum = CheckSum((unsigned short *)encapsulationUdpData, packet_size);
-  udpHeader->check = checksum;
+  udpHeader->check = 0;
+  memcpy(encapsulationUdpData + full_header_len, buf_ptr, buf_size);
   
   // calculate new IP header:
   // for IPv4, packet length ((u_short)ipHeader->ip_len) and header checksum ((u_short)ipHeader->ip_sum)
   // for IPv6, payload length ((u_int16_t)ipHeader6->ip6_ctlun.ip6_un1.ip6_un1_plen)
   if (pkt_type == IPv4) {       //IPV4
       ipHeader->ip_len = htons(packet_size);
-      checksum = CheckSum((unsigned short *)encapsulationUdpData, packet_size);
-      ipHeader->ip_sum = checksum;
+      ipHeader->ip_sum = 0;
+      ipHeader->ip_sum = CheckSum((unsigned short *)encapsulationUdpData, ip_header_len);
+      
+      // calculate new UDP checksum using IP pseudoheader
+      pshdr.psh.source_address = ipHeader->ip_src;
+      pshdr.psh.dest_address = ipHeader->ip_dst;
+      pshdr.psh.placeholder = 0;
+      pshdr.psh.protocol = IPPROTO_UDP;
+      pshdr.psh.udp_length = htons(sizeof(struct udphdr) + buf_size);
+      pgram_size = sizeof(struct pseudo_header) + sizeof(struct udphdr) + buf_size;
+      pseudogram = malloc(pgram_size);
+      memcpy(pseudogram, (unsigned char *) &pshdr.psh, sizeof (struct pseudo_header));
+      memcpy(pseudogram + sizeof(struct pseudo_header), udpHeader, sizeof(struct udphdr) + buf_size);
+      udpHeader->check = CheckSum((unsigned short *)pseudogram, packet_size);
+      free(pseudogram);
+      
   } else if (pkt_type == IPv6) {  //IPv6  
       ipHeader6->ip6_ctlun.ip6_un1.ip6_un1_plen = htons(packet_size);
+      
+      // calculate new UDP checksum using IP pseudoheader
+      pshdr.psh6.ip6_src = ipHeader6->ip6_src;
+      pshdr.psh6.ip6_dst = ipHeader6->ip6_dst;
+      pshdr.psh6.udp_length = UDP_HEADER_LENGTH + buf_size;
+      pshdr.psh6.zeros1 = 0;
+      pshdr.psh6.zeros2 = 0;
+      pgram_size = sizeof(struct pseudo_header6) + sizeof(struct udphdr) + buf_size;
+      pshdr.psh6.protocol = IPPROTO_UDP;
+      pseudogram = malloc(pgram_size);
+      memcpy(pseudogram, (unsigned char *) &pshdr.psh6, sizeof (struct pseudo_header6));
+      memcpy(pseudogram + sizeof(struct pseudo_header6), udpHeader, sizeof(struct udphdr) + buf_size);
+      udpHeader->check = CheckSum((unsigned short *)pseudogram, packet_size);
+      free(pseudogram);
   }
   
   // send the packet to OLSR forward mechanism
@@ -1473,7 +1506,7 @@ int UpdateServices(void) {
   unsigned int found_domain, ttl, match_string_len;
   size_t dname_len, service_name_len, service_type_len, service_file_dir_len;
   int ret;
-  struct MdnsService *service, *tmp;
+  struct MdnsService *service;
   
   dp = opendir(ServiceFileDir);
   if (dp == NULL) {

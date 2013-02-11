@@ -1,7 +1,7 @@
 
 OLSRD_PLUGIN =	true
 PLUGIN_NAME =	olsrd_dnssd
-PLUGIN_VER =	0.1.0
+PLUGIN_VER =	0.1.1
 
 TOPDIR = ../..
 include $(TOPDIR)/Makefile.inc

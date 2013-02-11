@@ -114,6 +114,23 @@ struct MdnsService {
   UT_hash_handle                 hh;
 };
 
+struct pseudo_header {
+  struct in_addr source_address;
+  struct in_addr dest_address;
+  u_int8_t placeholder;
+  u_int8_t protocol;
+  u_int16_t udp_length;
+};
+
+struct pseudo_header6 {
+  struct in6_addr ip6_src;
+  struct in6_addr ip6_dst;
+  u_int32_t udp_length;
+  u_int16_t zeros1;
+  u_int8_t zeros2;
+  u_int8_t protocol;
+};
+
 typedef enum { IPv4, IPv6 } PKT_TYPE;
 extern int ServiceUpdateInterval;
 
