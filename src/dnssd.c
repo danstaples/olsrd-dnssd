@@ -90,10 +90,12 @@
 #include "PacketHistory.h"
 #include "dllist.h"
 
-// struct RrListByTtl *rr_buffer    = NULL;
+struct timer_entry *service_update_timer = NULL;
 struct MdnsService *ServiceList    = NULL;
 char ServiceDomain[MAX_DOMAIN_LEN];
 size_t ServiceDomainLength;
+char *ServiceFileDir;
+int ServiceUpdateInterval          = 300;
 
 int P2pdTtl                        = 0;
 int P2pdUseHash                    = 0;  /* Switch off hash filter by default */
@@ -697,7 +699,9 @@ P2pdPacketCaptured(unsigned char *encapsulationUdpData, int nBytes)
     p_size = nBytes - GetIpHeaderLength(encapsulationUdpData) - UDP_HEADER_LENGTH;
     s = ldns_wire2pkt(&p, ARM_NOWARN_ALIGN(encapsulationUdpData + GetIpHeaderLength(encapsulationUdpData) + UDP_HEADER_LENGTH), p_size);
     if (s != LDNS_STATUS_OK) {
+#ifdef INCLUDE_DEBUG_OUTPUT
       OLSR_PRINTF(1, "%s: Error getting ipv4 dns packet\n", PLUGIN_NAME_SHORT);
+#endif
       return;
     }
     
@@ -748,7 +752,9 @@ P2pdPacketCaptured(unsigned char *encapsulationUdpData, int nBytes)
     p_size = nBytes - IPV6_HEADER_LENGTH - UDP_HEADER_LENGTH;
     s = ldns_wire2pkt(&p, ARM_NOWARN_ALIGN(encapsulationUdpData + IPV6_HEADER_LENGTH + UDP_HEADER_LENGTH), p_size);
     if (s != LDNS_STATUS_OK) {
+#ifdef INCLUDE_DEBUG_OUTPUT
       OLSR_PRINTF(1, "%s: Error getting ipv6 dns packet\n", PLUGIN_NAME_SHORT);
+#endif
       return;
     }
     
@@ -852,7 +858,9 @@ void DnssdSendPacket(ldns_pkt *pkt, PKT_TYPE pkt_type, unsigned char *encapsulat
   
   // copy new packet data to encapsulationUdpData buffer (size should be smaller than original packet, so should be no need to re-allocate space)
   if (packet_size > nBytes) {
+#ifdef INCLUDE_DEBUG_OUTPUT
     OLSR_PRINTF(1, "%s: New packet size exceeds buffer size!\n", PLUGIN_NAME_SHORT);
+#endif
     olsr_p2pd_gen(encapsulationUdpData, nBytes, 0);  // if new packet larger than original, send original packet unmodified
     free(buf_ptr);
     return;
@@ -1126,6 +1134,9 @@ void
 CloseP2pd(void)
 {
   CloseNonOlsrNetworkInterfaces();
+  olsr_stop_timer(service_update_timer);
+  free(ServiceFileDir);
+  DeleteAllServices();
 }
 
 /* -------------------------------------------------------------------------
@@ -1404,8 +1415,50 @@ check_and_mark_recent_packet(unsigned char *data,
   return false;
 }
 
+/* -------------------------------------------------------------------------
+ * Function   : SetupServiceList
+ * Description: Validates PmParam 'ServiceFileDir' and populates list of
+ *              local services
+ * Input      : value - comes from PlParam 'ServiceFileDir'
+ * Output     : none
+ * Return     : 0 on success, -1 on error
+ * Data Used  : none
+ * ------------------------------------------------------------------------- */
 int SetupServiceList(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused))) {
-  //char filename[MAX_FILE_LEN + 1];
+  size_t value_len;
+  
+  assert(value != NULL);
+  value_len = strlen(value);
+  
+  if (!value_len || value_len > MAX_FILE_LEN) {
+    OLSR_PRINTF(1, "%s: Invalid argument for \"ServiceFileDir\"", PLUGIN_NAME_SHORT);
+    return -1;
+  }
+  
+  ServiceFileDir = malloc(sizeof(char)*(value_len + 1));
+  strncpy(ServiceFileDir, value, value_len);
+  ServiceFileDir[value_len] = '\0';
+  
+  // do initial ServiceList population, and return -1 if it fails
+  if (UpdateServices() == -1)
+    return -1;
+  
+  // set timer for period ServiceList updating
+  service_update_timer = olsr_start_timer(ServiceUpdateInterval * MSEC_PER_SEC, EMISSION_JITTER, OLSR_TIMER_PERIODIC, (timer_cb_func)&UpdateServices, NULL, 0);
+    
+  return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Function   : UpdateServices
+ * Description: Fetches local Avahi service files with a TTL txt-record and
+ *              the target domain, and adds them to a list of local services
+ * Input      : none
+ * Output     : none
+ * Return     : 0 on success, -1 on error
+ * Data Used  : ServiceFileDir
+ * ------------------------------------------------------------------------- */
+int UpdateServices(void) {
   char file_suffix[9], line[BUFFER_LENGTH + 1], *ttl_string, *service_name, *service_type, *dirpath, *fullpath, hostname[HOSTNAME_LEN + 1];
   DIR *dp;
   FILE *fp;
@@ -1418,54 +1471,57 @@ int SetupServiceList(const char *value, void *data __attribute__ ((unused)), set
   const int n_matches = 3;
   regmatch_t match[n_matches];
   unsigned int found_domain, ttl, match_string_len;
-  size_t value_len, dname_len, service_name_len, service_type_len;
+  size_t dname_len, service_name_len, service_type_len, service_file_dir_len;
   int ret;
+  struct MdnsService *service, *tmp;
   
-  assert(value != NULL);
-  value_len = strlen(value);
-  
-  if (!value_len || value_len > MAX_FILE_LEN) {
-    OLSR_PRINTF(1, "%s: Invalid argument for \"ServiceFileDir\"", PLUGIN_NAME_SHORT);
-    return -1;
-  }
-  
-  dp = opendir(value);
+  dp = opendir(ServiceFileDir);
   if (dp == NULL) {
     OLSR_PRINTF(1, "%s: Unable to open directory given by \"ServiceFileDir\"", PLUGIN_NAME_SHORT);
     return -1;
   }
   
-  if (value[value_len - 1] == '/') {
-    dirpath = malloc(sizeof(char)*(value_len + 1));
-    strncpy(dirpath,value,value_len);
-    dirpath[value_len] = '\0';
+  // check for trailing backslash
+  service_file_dir_len = strlen(ServiceFileDir);
+  if (ServiceFileDir[service_file_dir_len - 1] == '/') {
+    dirpath = malloc(sizeof(char)*(service_file_dir_len + 1));
+    strncpy(dirpath,ServiceFileDir,service_file_dir_len);
+    dirpath[service_file_dir_len] = '\0';
   } else {
-    dirpath = malloc(sizeof(char)*(value_len + 2));
-    strncpy(dirpath,value,value_len);
-    dirpath[value_len] = '/';
-    dirpath[value_len + 1] = '\0';
+    dirpath = malloc(sizeof(char)*(service_file_dir_len + 2));
+    strncpy(dirpath,ServiceFileDir,service_file_dir_len);
+    dirpath[service_file_dir_len] = '/';
+    dirpath[service_file_dir_len + 1] = '\0';
   }
   
+  // Compile regex objects
   if (asprintf(&domain_pattern, "^[[:space:]]*<domain-name>%s</domain-name>[[:space:]]*$",ServiceDomain) == -1) {
+#ifdef INCLUDE_DEBUG_OUTPUT
     OLSR_PRINTF(1, "%s: Unable to allocate domain_pattern", PLUGIN_NAME_SHORT);
+#endif
     return -1;
   }
   if (regcomp(&ttl_regex, ttl_pattern, REG_NEWLINE | REG_EXTENDED) || 
 		regcomp(&domain_regex, domain_pattern, REG_NOSUB | REG_NEWLINE | REG_EXTENDED) ||
 		regcomp(&name_regex, name_pattern, REG_NEWLINE | REG_EXTENDED) || 
      		regcomp(&type_regex, type_pattern, REG_NEWLINE | REG_EXTENDED)) {
+#ifdef INCLUDE_DEBUG_OUTPUT
     OLSR_PRINTF(1, "%s: Unable to compile regex", PLUGIN_NAME_SHORT);
+#endif
     return -1;
   }
   
+  // set uptodate = 0 for all Services
+  for (service = ServiceList; service != NULL; service=service->hh.next)
+    service->uptodate = 0;
+  
+  // iterate through files in ServiceFileDir and check against our regex objects
   while ((ep = readdir(dp))) {
-    // if ep->d_name ends in .service, open it
     dname_len = strlen(ep->d_name);
     if (dname_len > 8 && dname_len < MAX_DIR_LEN) {
       strncpy(file_suffix, ep->d_name + dname_len - 8, 8);
       file_suffix[8] = '\0';
-      if (!strcmp(file_suffix,".service")) {
-        // if correct domain and has u_int ttl txt-record, add to ServiceList
+      if (!strcmp(file_suffix,".service")) {   // if ep->d_name ends in .service, open it
         found_domain = 0;
 	ttl = 0;
 	service_name = NULL;
@@ -1475,15 +1531,17 @@ int SetupServiceList(const char *value, void *data __attribute__ ((unused)), set
 	strcat(fullpath,ep->d_name);
         fp = fopen(fullpath, "rt");
 	if (fp == NULL) {
+#ifdef INCLUDE_DEBUG_OUTPUT
 	  OLSR_PRINTF(1, "%s: Error opening file %s: %s\n", PLUGIN_NAME_SHORT, fullpath, strerror(errno));
+#endif
 	  return -1;
 	}
 	free(fullpath);
         while (fgets(line, BUFFER_LENGTH, fp)) {
-	  if (!found_domain && !regexec(&domain_regex, line, 0, NULL, 0)) {
+	  if (!found_domain && !regexec(&domain_regex, line, 0, NULL, 0)) {  // check for target domain
 	    found_domain = 1;
 	  }
-	  else if (!ttl  && !regexec(&ttl_regex, line, n_matches, match, 0)) {
+	  else if (!ttl  && !regexec(&ttl_regex, line, n_matches, match, 0)) {  // check for u_int TTL value
 	    // parse match and store ttl
 	    if (match[1].rm_so != -1) {
 	      match_string_len = match[1].rm_eo - match[1].rm_so;
@@ -1494,7 +1552,7 @@ int SetupServiceList(const char *value, void *data __attribute__ ((unused)), set
 	      free(ttl_string);
 	      ttl = (ttl < 255 && ttl > 0) ? ttl : 0;
 	    }
-	  } else if (!service_name && !regexec(&name_regex, line, n_matches, match, 0)) {
+	  } else if (!service_name && !regexec(&name_regex, line, n_matches, match, 0)) {  // check for valid service name
 	    if (match[2].rm_so != -1) {
 	      service_name_len = match[2].rm_eo - match[2].rm_so;
 	      service_name = malloc(sizeof(char)*(service_name_len + 1));
@@ -1504,17 +1562,17 @@ int SetupServiceList(const char *value, void *data __attribute__ ((unused)), set
 		// replace %h with hostname
 		ret = gethostname(hostname, HOSTNAME_LEN + 1);
 		if (ret == -1) {
+#ifdef INCLUDE_DEBUG_OUTPUT
 		  OLSR_PRINTF(1, "%s: Error fetching hostname\n", PLUGIN_NAME_SHORT);
+#endif
 		  return -1;
 		}
 		hostname[HOSTNAME_LEN] = '\0';
-		//OLSR_PRINTF(1, "%s: before service_name: [%s]\n", PLUGIN_NAME_SHORT, service_name);
 		service_name = ReplaceHostname(service_name, service_name_len, hostname, strlen(hostname));
 		service_name_len = strlen(service_name);
-		//OLSR_PRINTF(1, "%s: after service_name: [%s]\n", PLUGIN_NAME_SHORT, service_name);
 	      }
 	    }
-	  } else if (!service_type && !regexec(&type_regex, line, n_matches, match, 0)) {
+	  } else if (!service_type && !regexec(&type_regex, line, n_matches, match, 0)) {  // check for valid service type
 	    if (match[1].rm_so != -1) {
 	      service_type_len = match[1].rm_eo - match[1].rm_so;
 	      service_type = malloc(sizeof(char)*(service_type_len + 1));
@@ -1524,9 +1582,9 @@ int SetupServiceList(const char *value, void *data __attribute__ ((unused)), set
 	  }
 	}
         fclose(fp);
-	// check found_domain and ttl...if yes, add to servicelist
+	// If all the matches succeeded, add service to ServiceList (sets uptodate = 1)
 	if (service_name && service_type && found_domain && ttl) {
-	  OLSR_PRINTF(1, "Adding local service: %s\n", ep->d_name);
+	  OLSR_PRINTF(1, "%s: Adding local service: %s\n", PLUGIN_NAME_SHORT, ep->d_name);
 	  AddToServiceList(service_name, service_name_len, service_type, service_type_len, ep->d_name, dname_len, ttl);
 	}
 	if (service_name)
@@ -1539,7 +1597,10 @@ int SetupServiceList(const char *value, void *data __attribute__ ((unused)), set
   (void)closedir(dp);
   
   if (ServiceList == NULL) {
-    OLSR_PRINTF(1, "No valid service files found!\n");
+    OLSR_PRINTF(1, "%s: No valid service files found!\n", PLUGIN_NAME_SHORT);
+  } else {
+    // remove all services with uptodate == 0
+    RemoveStaleServices();
   }
   
   regfree(&domain_regex);
@@ -1552,6 +1613,18 @@ int SetupServiceList(const char *value, void *data __attribute__ ((unused)), set
   return 0;
 }
 
+/* -------------------------------------------------------------------------
+ * Function   : ReplaceHostname
+ * Description: Replaces %h in string with provided hostname
+ * Input      : str - pointer to dynamically allocated buffer containing 
+ *                    target string to manipulate
+ *              nBytes - size of str in bytes, not including null ptr
+ *              hostname - hostname to replace %h with
+ *              hostname_len - size of hostname not including null ptr
+ * Output     : none
+ * Return     : pointer to new str buffer (caller must remember to free)
+ * Data Used  : none
+ * ------------------------------------------------------------------------- */
 char *ReplaceHostname(char *str, size_t nBytes, const char *hostname, size_t hostname_len) {
   char *ptr, str_beginning[nBytes], str_end[nBytes];
   size_t beginning_len, end_len;
@@ -1573,6 +1646,14 @@ char *ReplaceHostname(char *str, size_t nBytes, const char *hostname, size_t hos
   return str;
 }
 
+/* -------------------------------------------------------------------------
+ * Function   : SetDomain
+ * Description: Sets target domain using PlParam 'Domain'
+ * Input      : value - comes from PlParam 'Domain'
+ * Output     : none
+ * Return     : 0 on success, -1 on error
+ * Data Used  : ServiceDomain
+ * ------------------------------------------------------------------------- */
 int SetDomain(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused))) {
   assert(value != NULL);
   
@@ -1590,6 +1671,18 @@ int SetDomain(const char *value, void *data __attribute__ ((unused)), set_plugin
   return 0;
 }
 
+/* -------------------------------------------------------------------------
+ * Function   : AddToRrBuffer
+ * Description: Adds an RR list to an RrListByTtl array based on TTL
+ * Input      : buf - pointer to array of RrListByTtl struct the passed RR
+ *                    list will be added to (caller must remember to free)
+ *              ttl - TTL value of the RrListByTtl to add the RR list to
+ *              entry - RR list to be added to buf
+ *              section - type of DNS section the RR list came from
+ * Output     : none
+ * Return     : none
+ * Data Used  : none
+ * ------------------------------------------------------------------------- */
 void AddToRrBuffer(struct RrListByTtl **buf, int ttl, ldns_rr *entry, int section) {
   struct RrListByTtl *s;
   int i;
@@ -1612,13 +1705,21 @@ void AddToRrBuffer(struct RrListByTtl **buf, int ttl, ldns_rr *entry, int sectio
   }
 }
 
-struct RrListByTtl *GetRrListByTtl(const struct RrListByTtl **buf, int ttl) {
-  struct RrListByTtl *s;
-  
-  HASH_FIND_INT(*buf, &ttl, s);
-  return s;
-}
-
+/* -------------------------------------------------------------------------
+ * Function   : AddToServiceList
+ * Description: Add a local service to ServiceList
+ * Input      : name - the name of the service
+ *              name_len - length of service name
+ *              type - the type of the service (i.e. _http._tcp)
+ *              type_len - length of type string
+ *              path - file name of service (i.e. example.service)
+ *              path_len - length of path string
+ *              ttl - the service's TTL value (i.e. max number of hops away
+ *                    the service should be advertised)
+ * Output     : none
+ * Return     : none
+ * Data Used  : ServiceList
+ * ------------------------------------------------------------------------- */
 void AddToServiceList(char *name, size_t name_len, char *type, size_t type_len, char *path, size_t path_len, int ttl) {
   struct MdnsService *s;
   char *id;
@@ -1632,7 +1733,7 @@ void AddToServiceList(char *name, size_t name_len, char *type, size_t type_len, 
   strncpy(id + name_len + 1,type,type_len);
   id[name_len + 1 + type_len] = '\0';
   HASH_FIND_STR(ServiceList, id, s);
-  if (s==NULL) {
+  if (s==NULL) {  // if entry doesn't exist, add it
     s = malloc(sizeof(struct MdnsService));
     strcpy(s->id, id);
     HASH_ADD_STR(ServiceList, id, s);
@@ -1641,7 +1742,15 @@ void AddToServiceList(char *name, size_t name_len, char *type, size_t type_len, 
   strcpy(s->service_type, type);
   strcpy(s->file_path, path);
   s->ttl = ttl;
+  s->uptodate = 1;
   free(id);
+}
+
+struct RrListByTtl *GetRrListByTtl(const struct RrListByTtl **buf, int ttl) {
+  struct RrListByTtl *s;
+  
+  HASH_FIND_INT(*buf, &ttl, s);
+  return s;
 }
 
 struct MdnsService *GetServiceById(char *id) {
@@ -1671,7 +1780,24 @@ void DeleteListArray(struct RrListByTtl **buf) {
   }
 }
 
+void DeleteAllServices(void) {
+  struct MdnsService *s, *tmp;
+  HASH_ITER(hh, ServiceList, s, tmp) {
+    DeleteService(s);
+  }
+}
+
 void DeleteService(struct MdnsService *service) {
   HASH_DEL(ServiceList, service);
   free(service);
+}
+
+void RemoveStaleServices(void) {
+  struct MdnsService *s, *tmp;
+  HASH_ITER(hh, ServiceList, s, tmp) {
+    if (!s->uptodate) {
+      OLSR_PRINTF(1, "%s: Removing local service: %s\n", PLUGIN_NAME_SHORT, s->file_path);
+      DeleteService(s);
+    }
+  }
 }

@@ -2,7 +2,7 @@
 
 This README file is the main documentation source for the OLSR DNSSD plugin
 
-Last update Feb 9, 2013
+Last update Feb 11, 2013
 
 == Description ==
 
@@ -51,6 +51,8 @@ PlParam     "UdpDestPort" "224.0.0.251 5353"
 PlParam     "ServiceFileDir" "/etc/avahi/services"
 #   Domain used for advertising services
 PlParam     "Domain"      "mesh.local"
+#   Interval in seconds for updating local service list
+PlParam     "ServiceUpdateInterval" "300"
 }
 
 Where eth0 and eth1 are the names of the interfaces where you want to capture
@@ -126,4 +128,7 @@ forwards UDP plugin OLSR packets even if it is not aware of the new application.
 Revision history
 ================
 
+02/11/2013 - Added ServiceUpdateInterval configuration parameter for periodically
+             refreshing list of local services
+             * Declaring this version 0.1.0
 02/09/2013 - Initial version released for feedback and testing

@@ -76,6 +76,8 @@
 #define IPV6_HEADER_LENGTH        40
 #define UDP_HEADER_LENGTH         8
 #define HOSTNAME_LEN              64
+#define SERVICE_UPDATE_INTERVAL   300
+#define EMISSION_JITTER           25      /* percent */
 
 /* Forward declaration of OLSR interface type */
 struct interface;
@@ -108,10 +110,12 @@ struct MdnsService {
   char                           service_type[MAX_FIELD_LEN + 1];
   char                           file_path[MAX_FILE_LEN + 1];
   int                            ttl;
+  int                            uptodate;
   UT_hash_handle                 hh;
 };
 
 typedef enum { IPv4, IPv6 } PKT_TYPE;
+extern int ServiceUpdateInterval;
 
 extern int P2pdTtl;
 extern int P2pdDuplicateTimeout;
@@ -141,6 +145,7 @@ bool olsr_parser(union olsr_message *, struct interface *, union olsr_ip_addr *)
 
 int SetupServiceList(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused)));
 int SetDomain(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused)));
+int UpdateServices(void);
 
 void AddToRrBuffer(struct RrListByTtl **buf, int ttl, ldns_rr *entry, int section);
 struct RrListByTtl *GetRrListByTtl(const struct RrListByTtl **buf, int ttl);
@@ -149,7 +154,9 @@ struct MdnsService *GetServiceById(char *id);
 void DeleteListByTtl(struct RrListByTtl **buf, int ttl);
 void DeleteList(struct RrListByTtl **buf, struct RrListByTtl *list);
 void DeleteListArray(struct RrListByTtl **buf);
+void DeleteAllServices(void);
 void DeleteService(struct MdnsService *service);
+void RemoveStaleServices(void);
 void DnssdSendPacket(ldns_pkt *pkt, PKT_TYPE pkt_type, unsigned char *encapsulationUdpData, int nBytes, int ttl);
 int IsRrLocal(ldns_rr *rr, int *ttl);
 size_t UnescapeStr(char *str, size_t nBytes);
