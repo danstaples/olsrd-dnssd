@@ -2,7 +2,7 @@
 
 This README file is the main documentation source for the OLSR DNSSD plugin
 
-Last update Feb 11, 2013
+Last update Feb 14, 2013
 
 == Description ==
 
@@ -33,7 +33,7 @@ as a txt-record. Here is an example service file with a TTL value:
 
 To enable the Plugin use the following syntax:
 
-LoadPlugin "olsrd_dnssd.so.0.1.1"
+LoadPlugin "olsrd_dnssd.so.0.1.2
 {
 # Specify interfaces where the hosts running Peer to Peer applications are
 # attached
@@ -128,6 +128,10 @@ forwards UDP plugin OLSR packets even if it is not aware of the new application.
 Revision history
 ================
 
+02/14/2013 - Fixed bugs relating to capturing outgoing packets, and hostname
+             replacement in service names. 
+             * Plugin has been tested and verified to be working. 
+             * Version 0.1.2
 02/11/2013 - Fixed packet checksum calculations
 02/11/2013 - Added ServiceUpdateInterval configuration parameter for periodically
              refreshing list of local services

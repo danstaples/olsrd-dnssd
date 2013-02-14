@@ -470,7 +470,7 @@ void
 olsr_p2pd_gen(unsigned char *packet, int len, int ttl)
 {
   /* send buffer: huge */
-  char buffer[10240];
+  char buffer[10240] = {'\0',};
   int aligned_size, pkt_ttl;
   union olsr_message *message = (union olsr_message *)buffer;
   struct interface *ifn;
@@ -838,46 +838,41 @@ void DnssdSendPacket(ldns_pkt *pkt, PKT_TYPE pkt_type, unsigned char *encapsulat
   struct ip *ipHeader;
   struct ip6_hdr *ipHeader6;
   struct udphdr *udpHeader;
-  unsigned char *pseudogram;
+  unsigned char *pseudogram, *new_pkt;
   size_t pgram_size;
   union {
     struct pseudo_header psh;
     struct pseudo_header6 psh6;
   } pshdr;
 
+  // convert packet to wire format buffer
+  ldns_pkt2wire(&buf_ptr, pkt, &buf_size);
+  
   // Set up packet headers
   if (pkt_type == IPv4) {
-    ipHeader = (struct ip *) ARM_NOWARN_ALIGN(encapsulationUdpData);
-    udpHeader = (struct udphdr *) ARM_NOWARN_ALIGN((encapsulationUdpData + GetIpHeaderLength(encapsulationUdpData)));
     ip_header_len = GetIpHeaderLength(encapsulationUdpData);
     full_header_len = ip_header_len + UDP_HEADER_LENGTH;
+    new_pkt = calloc(full_header_len + buf_size, sizeof(unsigned char));
+    memcpy(new_pkt, encapsulationUdpData, full_header_len);
+    ipHeader = (struct ip *) ARM_NOWARN_ALIGN(new_pkt);
+    udpHeader = (struct udphdr *) ARM_NOWARN_ALIGN((new_pkt + ip_header_len));
   } else if (pkt_type == IPv6) {
-    ipHeader6 = (struct ip6_hdr *) ARM_NOWARN_ALIGN(encapsulationUdpData);
-    udpHeader = (struct udphdr *) ARM_NOWARN_ALIGN((encapsulationUdpData + 40));
     ip_header_len = IPV6_HEADER_LENGTH;
     full_header_len = ip_header_len + UDP_HEADER_LENGTH;
+    new_pkt = calloc(full_header_len + buf_size, sizeof(unsigned char));
+    memcpy(new_pkt, encapsulationUdpData, full_header_len);
+    ipHeader6 = (struct ip6_hdr *) ARM_NOWARN_ALIGN(new_pkt);
+    udpHeader = (struct udphdr *) ARM_NOWARN_ALIGN((new_pkt + ip_header_len));
   } else
     return;
   
-  // convert packet to wire format buffer
-  ldns_pkt2wire(&buf_ptr, pkt, &buf_size);
   packet_size = full_header_len + buf_size;
   
-  // copy new packet data to encapsulationUdpData buffer (size should be smaller than original packet, so should be no need to re-allocate space)
-  if (packet_size > nBytes) {
-#ifdef INCLUDE_DEBUG_OUTPUT
-    OLSR_PRINTF(1, "%s: New packet size exceeds buffer size!\n", PLUGIN_NAME_SHORT);
-#endif
-    olsr_p2pd_gen(encapsulationUdpData, nBytes, 0);  // if new packet larger than original, send original packet unmodified
-    free(buf_ptr);
-    return;
-  }
-
   // time to do some raw packet-fu
-
+  memcpy(new_pkt + full_header_len, buf_ptr, buf_size);
+  
   udpHeader->len = htons(UDP_HEADER_LENGTH + buf_size);
   udpHeader->check = 0;
-  memcpy(encapsulationUdpData + full_header_len, buf_ptr, buf_size);
   
   // calculate new IP header:
   // for IPv4, packet length ((u_short)ipHeader->ip_len) and header checksum ((u_short)ipHeader->ip_sum)
@@ -885,7 +880,7 @@ void DnssdSendPacket(ldns_pkt *pkt, PKT_TYPE pkt_type, unsigned char *encapsulat
   if (pkt_type == IPv4) {       //IPV4
       ipHeader->ip_len = htons(packet_size);
       ipHeader->ip_sum = 0;
-      ipHeader->ip_sum = CheckSum((unsigned short *)encapsulationUdpData, ip_header_len);
+      ipHeader->ip_sum = CheckSum((unsigned short *)new_pkt, ip_header_len);
       
       // calculate new UDP checksum using IP pseudoheader
       pshdr.psh.source_address = ipHeader->ip_src;
@@ -897,7 +892,7 @@ void DnssdSendPacket(ldns_pkt *pkt, PKT_TYPE pkt_type, unsigned char *encapsulat
       pseudogram = malloc(pgram_size);
       memcpy(pseudogram, (unsigned char *) &pshdr.psh, sizeof (struct pseudo_header));
       memcpy(pseudogram + sizeof(struct pseudo_header), udpHeader, sizeof(struct udphdr) + buf_size);
-      udpHeader->check = CheckSum((unsigned short *)pseudogram, packet_size);
+      udpHeader->check = CheckSum((unsigned short *)pseudogram, pgram_size);
       free(pseudogram);
       
   } else if (pkt_type == IPv6) {  //IPv6  
@@ -914,13 +909,14 @@ void DnssdSendPacket(ldns_pkt *pkt, PKT_TYPE pkt_type, unsigned char *encapsulat
       pseudogram = malloc(pgram_size);
       memcpy(pseudogram, (unsigned char *) &pshdr.psh6, sizeof (struct pseudo_header6));
       memcpy(pseudogram + sizeof(struct pseudo_header6), udpHeader, sizeof(struct udphdr) + buf_size);
-      udpHeader->check = CheckSum((unsigned short *)pseudogram, packet_size);
+      udpHeader->check = CheckSum((unsigned short *)pseudogram, pgram_size);
       free(pseudogram);
   }
   
   // send the packet to OLSR forward mechanism
-  olsr_p2pd_gen(encapsulationUdpData, packet_size, ttl);
+  olsr_p2pd_gen(new_pkt, packet_size, ttl);
   free(buf_ptr);
+  free(new_pkt);
 }
 
 /* -------------------------------------------------------------------------
@@ -983,6 +979,7 @@ int IsRrLocal(ldns_rr *rr, int *ttl) {
   id = malloc(sizeof(char)*(strlen(owner_str) - strlen(ServiceDomain) - 1));
   strncpy(id, owner_str, strlen(owner_str) - strlen(ServiceDomain) - 2);
   id[strlen(owner_str) - strlen(ServiceDomain) - 2] = '\0';
+  
   s = GetServiceById(id);
   free(owner_str);
   free(id);
@@ -991,7 +988,7 @@ int IsRrLocal(ldns_rr *rr, int *ttl) {
     *ttl = s->ttl;
     return 1;
   }
-  
+
   // if type == PTR && RDATA == <service name>.<type>.<domain>.
   if (rr->_rr_type == LDNS_RR_TYPE_PTR && rr->_rd_count == 1) {
     // check RDATA
@@ -1004,6 +1001,7 @@ int IsRrLocal(ldns_rr *rr, int *ttl) {
     id = malloc(sizeof(char)*(strlen(rdata_str) - strlen(ServiceDomain) - 1));
     strncpy(id, rdata_str, strlen(rdata_str) - strlen(ServiceDomain) - 2);
     id[strlen(rdata_str) - strlen(ServiceDomain) - 2] = '\0';
+    
     s = GetServiceById(id);
     free(rdata_str);
     free(id);
@@ -1601,7 +1599,10 @@ int UpdateServices(void) {
 		  return -1;
 		}
 		hostname[HOSTNAME_LEN] = '\0';
-		service_name = ReplaceHostname(service_name, service_name_len, hostname, strlen(hostname));
+		if ((service_name = ReplaceHostname(service_name, service_name_len, hostname, strlen(hostname))) == NULL) {
+		  OLSR_PRINTF(1, "%s: Error replacing hostname in servicename\n", PLUGIN_NAME_SHORT);
+		  return -1;
+		}
 		service_name_len = strlen(service_name);
 	      }
 	    }
@@ -1658,9 +1659,15 @@ int UpdateServices(void) {
  * Return     : pointer to new str buffer (caller must remember to free)
  * Data Used  : none
  * ------------------------------------------------------------------------- */
-char *ReplaceHostname(char *str, size_t nBytes, const char *hostname, size_t hostname_len) {
+char *ReplaceHostname(char *str, size_t nBytes, char *hostname, size_t hostname_len) {
   char *ptr, str_beginning[nBytes], str_end[nBytes];
   size_t beginning_len, end_len;
+  
+  if (hostname[hostname_len] != '\0')
+    return NULL;
+  
+  // mDNS strips out underscores from hostname, so let's just take care of that now.
+  removeChar(hostname, &hostname_len, '_');
   
   while ((ptr = strstr(str, "%h")) != NULL) {
     beginning_len = ptr - str;
@@ -1765,6 +1772,7 @@ void AddToServiceList(char *name, size_t name_len, char *type, size_t type_len, 
   id[name_len] = '.';
   strncpy(id + name_len + 1,type,type_len);
   id[name_len + 1 + type_len] = '\0';
+
   HASH_FIND_STR(ServiceList, id, s);
   if (s==NULL) {  // if entry doesn't exist, add it
     s = malloc(sizeof(struct MdnsService));
@@ -1833,4 +1841,20 @@ void RemoveStaleServices(void) {
       DeleteService(s);
     }
   }
+}
+
+void removeChar(char *str, size_t *str_len, char garbage) {
+  char *src, *dst;
+  
+  if (str[*str_len] != '\0')
+    return;
+  
+  for (src = dst = str; *src != '\0'; src++) {
+    *dst = *src;
+    if (*dst != garbage) 
+      dst++;
+    else
+      *str_len -= 1;
+  }
+  *dst = '\0';
 }

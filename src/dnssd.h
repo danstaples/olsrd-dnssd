@@ -146,7 +146,6 @@ void P2pdPError(const char *format, ...) __attribute__ ((format(printf, 1, 2)));
 union olsr_ip_addr *MainAddressOf(union olsr_ip_addr *ip);
 int InitP2pd(struct interface *skipThisIntf);
 void CloseP2pd(void);
-//int SetP2pdTtl(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused)));
 int AddUdpDestPort(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused)));
 bool InUdpDestPortList(int ip_version, union olsr_ip_addr *addr, uint16_t port);
 int SetP2pdTtl(const char *value, void *data __attribute__ ((unused)), set_plugin_parameter_addon addon __attribute__ ((unused)));
@@ -177,8 +176,9 @@ void RemoveStaleServices(void);
 void DnssdSendPacket(ldns_pkt *pkt, PKT_TYPE pkt_type, unsigned char *encapsulationUdpData, int nBytes, int ttl);
 int IsRrLocal(ldns_rr *rr, int *ttl);
 size_t UnescapeStr(char *str, size_t nBytes);
-char *ReplaceHostname(char *str, size_t nBytes, const char *hostname, size_t hostname_len);
+char *ReplaceHostname(char *str, size_t nBytes, char *hostname, size_t hostname_len);
 unsigned short CheckSum(unsigned short *ptr,int nbytes);
+void removeChar(char *str, size_t *str_len, char garbage);
 
 #endif /* _DNSSD_H */
 

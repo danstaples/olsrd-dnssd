@@ -98,11 +98,12 @@ CreateCaptureSocket(const char *ifName)
   struct sockaddr_ll bindTo;
   int skfd = 0;
   /* Open cooked IP packet socket */
-  if (olsr_cnf->ip_version == AF_INET) {
+  /*if (olsr_cnf->ip_version == AF_INET) {
     skfd = socket(PF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
   } else {
     skfd = socket(PF_PACKET, SOCK_DGRAM, htons(ETH_P_IPV6));
-  }
+  }*/
+  skfd = socket(PF_PACKET, SOCK_DGRAM, htons(ETH_P_ALL));   /* use ETH_P_ALL so we can capture outgoing packets */
   if (skfd < 0) {
     P2pdPError("socket(PF_PACKET) error");
     return -1;
@@ -131,11 +132,12 @@ CreateCaptureSocket(const char *ifName)
   /* Bind the socket to the specified interface */
   memset(&bindTo, 0, sizeof(bindTo));
   bindTo.sll_family = AF_PACKET;
-  if (olsr_cnf->ip_version == AF_INET) {
+  /*if (olsr_cnf->ip_version == AF_INET) {
     bindTo.sll_protocol = htons(ETH_P_IP);
   } else {
     bindTo.sll_protocol = htons(ETH_P_IPV6);
-  }
+  }*/
+  bindTo.sll_protocol = htons(ETH_P_ALL);  /* use ETH_P_ALL so we can capture outgoing packets */
   bindTo.sll_ifindex = ifIndex;
   memcpy(bindTo.sll_addr, req.ifr_hwaddr.sa_data, IFHWADDRLEN);
   bindTo.sll_halen = IFHWADDRLEN;
